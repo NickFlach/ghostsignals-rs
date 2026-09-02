@@ -9,8 +9,13 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+/// Relative tolerance used to absorb floating-point dust when a sell brings
+/// an outstanding quantity or a position back to zero.
+pub(crate) const DUST_TOLERANCE: f64 = 1e-9;
+
 /// Errors that can occur in market operations
 #[derive(Error, Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum MarketError {
     #[error("Market not found")]
     MarketNotFound,
@@ -18,14 +23,25 @@ pub enum MarketError {
     MarketClosed,
     #[error("Market is already resolved")]
     MarketResolved,
+    #[error("Market is not resolved")]
+    MarketNotResolved,
     #[error("Invalid outcome index {outcome} for market with {num_outcomes} outcomes")]
     InvalidOutcome { outcome: usize, num_outcomes: usize },
     #[error("Must have at least 2 outcomes, got {0}")]
     InsufficientOutcomes(usize),
-    #[error("Liquidity parameter must be positive, got {0}")]
+    #[error("Liquidity parameter must be positive and finite, got {0}")]
     InvalidLiquidity(f64),
     #[error("Question cannot be empty")]
     EmptyQuestion,
+    #[error("Outcome label at index {0} cannot be empty")]
+    EmptyOutcomeLabel(usize),
+    #[error("Duplicate outcome label (case-insensitive): {0}")]
+    DuplicateOutcomeLabel(String),
+    /// A deserialized or externally constructed market violates an internal
+    /// invariant (quantity vector length, negative quantity, resolution
+    /// bookkeeping, ...).
+    #[error("Invalid market state: {0}")]
+    InvalidMarketState(String),
     #[error("LMSR calculation error: {0}")]
     LmsrError(#[from] LmsrError),
 }
@@ -42,7 +58,17 @@ pub enum MarketState {
 }
 
 /// A prediction market
+///
+/// # Invariants
+///
+/// A `Market` value always satisfies [`Market::validate`]: the liquidity is
+/// finite and positive, every outstanding quantity is finite and
+/// non-negative, the quantity vector matches the outcome list, and the
+/// current prices are computable. The invariants are enforced by
+/// [`Market::new`], by trade application, and by deserialization (an invalid
+/// serialized market is rejected instead of being loaded).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(try_from = "MarketRepr")]
 pub struct Market {
     /// Unique market identifier
     id: Uuid,
@@ -63,6 +89,66 @@ pub struct Market {
     /// Trading statistics
     trade_count: u64,
     total_volume: f64,
+    /// Net cash collected by the market maker (sum of trade costs, sells negative).
+    #[serde(default)]
+    pool: f64,
+}
+
+/// Wire representation of [`Market`]; deserialization goes through
+/// [`Market::validate`] so an invalid serialized market is refused.
+#[derive(Deserialize)]
+struct MarketRepr {
+    id: Uuid,
+    question: String,
+    outcomes: Vec<String>,
+    quantities: Vec<f64>,
+    liquidity: f64,
+    state: MarketState,
+    created_at: DateTime<Utc>,
+    resolved_outcome: Option<usize>,
+    trade_count: u64,
+    total_volume: f64,
+    #[serde(default)]
+    pool: f64,
+}
+
+impl TryFrom<MarketRepr> for Market {
+    type Error = MarketError;
+
+    fn try_from(repr: MarketRepr) -> Result<Self, Self::Error> {
+        let market = Market {
+            id: repr.id,
+            question: repr.question,
+            outcomes: repr.outcomes,
+            quantities: repr.quantities,
+            liquidity: repr.liquidity,
+            state: repr.state,
+            created_at: repr.created_at,
+            resolved_outcome: repr.resolved_outcome,
+            trade_count: repr.trade_count,
+            total_volume: repr.total_volume,
+            pool: repr.pool,
+        };
+        market.validate()?;
+        Ok(market)
+    }
+}
+
+/// Check outcome labels: non-empty after trimming and unique ignoring ASCII
+/// case (because [`Market::find_outcome`] is case-insensitive).
+fn validate_outcomes(outcomes: &[String]) -> Result<(), MarketError> {
+    if outcomes.len() < 2 {
+        return Err(MarketError::InsufficientOutcomes(outcomes.len()));
+    }
+    for (i, label) in outcomes.iter().enumerate() {
+        if label.trim().is_empty() {
+            return Err(MarketError::EmptyOutcomeLabel(i));
+        }
+        if outcomes[..i].iter().any(|prev| prev.eq_ignore_ascii_case(label)) {
+            return Err(MarketError::DuplicateOutcomeLabel(label.clone()));
+        }
+    }
+    Ok(())
 }
 
 impl Market {
@@ -75,6 +161,13 @@ impl Market {
     ///
     /// # Returns
     /// A new market with all quantities initialized to 0
+    ///
+    /// # Errors
+    /// * `EmptyQuestion` if the question is blank
+    /// * `InsufficientOutcomes` for fewer than two outcomes
+    /// * `EmptyOutcomeLabel` / `DuplicateOutcomeLabel` for blank or
+    ///   (case-insensitively) repeated labels
+    /// * `InvalidLiquidity` unless `liquidity` is finite and `> 0`
     pub fn new(
         question: String,
         outcomes: Vec<String>,
@@ -83,10 +176,8 @@ impl Market {
         if question.trim().is_empty() {
             return Err(MarketError::EmptyQuestion);
         }
-        if outcomes.len() < 2 {
-            return Err(MarketError::InsufficientOutcomes(outcomes.len()));
-        }
-        if liquidity <= 0.0 {
+        validate_outcomes(&outcomes)?;
+        if !(liquidity.is_finite() && liquidity > 0.0) {
             return Err(MarketError::InvalidLiquidity(liquidity));
         }
 
@@ -104,7 +195,56 @@ impl Market {
             resolved_outcome: None,
             trade_count: 0,
             total_volume: 0.0,
+            pool: 0.0,
         })
+    }
+
+    /// Check every structural invariant of the market.
+    ///
+    /// Always `Ok` for a market produced by this crate; exposed so callers
+    /// that persist markets can verify them explicitly.
+    pub fn validate(&self) -> Result<(), MarketError> {
+        if self.question.trim().is_empty() {
+            return Err(MarketError::EmptyQuestion);
+        }
+        validate_outcomes(&self.outcomes)?;
+        if !(self.liquidity.is_finite() && self.liquidity > 0.0) {
+            return Err(MarketError::InvalidLiquidity(self.liquidity));
+        }
+        if self.quantities.len() != self.outcomes.len() {
+            return Err(MarketError::InvalidMarketState(format!(
+                "{} quantities for {} outcomes",
+                self.quantities.len(),
+                self.outcomes.len()
+            )));
+        }
+        if let Some(&q) = self.quantities.iter().find(|q| !(q.is_finite() && **q >= 0.0)) {
+            return Err(MarketError::InvalidMarketState(format!(
+                "quantity {q} is negative or non-finite"
+            )));
+        }
+        for (name, value) in [("total_volume", self.total_volume), ("pool", self.pool)] {
+            if !value.is_finite() {
+                return Err(MarketError::InvalidMarketState(format!("{name} is {value}")));
+            }
+        }
+        match (self.state, self.resolved_outcome) {
+            (MarketState::Resolved, Some(outcome)) if outcome < self.outcomes.len() => {}
+            (MarketState::Resolved, other) => {
+                return Err(MarketError::InvalidMarketState(format!(
+                    "resolved market with resolved_outcome {other:?}"
+                )));
+            }
+            (_, Some(outcome)) => {
+                return Err(MarketError::InvalidMarketState(format!(
+                    "unresolved market carries resolved_outcome {outcome}"
+                )));
+            }
+            (_, None) => {}
+        }
+        // Prices must be computable (q / b must not overflow).
+        lmsr::prices(&self.quantities, self.liquidity)?;
+        Ok(())
     }
 
     /// Get market ID
@@ -147,19 +287,43 @@ impl Market {
         self.resolved_outcome
     }
 
-    /// Get trade statistics
+    /// Get trade statistics: `(number of trades, gross volume)` where gross
+    /// volume is the sum of `|cost|` over all trades.
     pub fn trade_stats(&self) -> (u64, f64) {
         (self.trade_count, self.total_volume)
     }
 
+    /// Net cash collected by the market maker: the sum of every trade's cost
+    /// (sells count negative).
+    ///
+    /// At resolution the market owes one unit per outstanding share of the
+    /// winning outcome, so the maker's profit is `pool() - quantities()[w]`,
+    /// which LMSR bounds below by `-liquidity() * ln(n)`.
+    pub fn pool(&self) -> f64 {
+        self.pool
+    }
+
     /// Calculate current market prices
+    ///
+    /// Always finite, each in `[0, 1]`, summing to 1 within rounding. A market
+    /// upholds [`Market::validate`], under which the LMSR price computation
+    /// cannot fail; the uniform fallback is unreachable and only exists so
+    /// this method never panics.
     #[must_use]
     pub fn prices(&self) -> Vec<f64> {
-        lmsr::prices(&self.quantities, self.liquidity)
-            .unwrap_or_else(|_| vec![1.0 / self.quantities.len() as f64; self.quantities.len()])
+        match lmsr::prices(&self.quantities, self.liquidity) {
+            Ok(prices) => prices,
+            Err(_) => {
+                debug_assert!(false, "market invariant violated: prices not computable");
+                vec![1.0 / self.quantities.len() as f64; self.quantities.len()]
+            }
+        }
     }
 
     /// Calculate cost of a hypothetical trade
+    ///
+    /// `amount` must be finite; non-finite amounts are refused with an
+    /// [`LmsrError::NonFinite`] wrapped in `MarketError::LmsrError`.
     pub fn trade_cost(&self, outcome: usize, amount: f64) -> Result<f64, MarketError> {
         if self.state != MarketState::Open {
             return Err(MarketError::MarketClosed);
@@ -176,7 +340,9 @@ impl Market {
 
     /// Update market quantities after a trade
     ///
-    /// This should only be called by the trading system
+    /// This should only be called by the trading system, after the caller
+    /// has verified the trader actually holds the shares being sold. The
+    /// market is left unchanged if the resulting state would be invalid.
     pub(crate) fn apply_trade(
         &mut self,
         outcome: usize,
@@ -192,10 +358,35 @@ impl Market {
                 num_outcomes: self.quantities.len(),
             });
         }
+        if !amount.is_finite() || !cost.is_finite() {
+            return Err(MarketError::LmsrError(LmsrError::NonFinite {
+                what: "trade amount or cost",
+                value: if amount.is_finite() { cost } else { amount },
+            }));
+        }
 
-        self.quantities[outcome] += amount;
+        let mut new_quantity = self.quantities[outcome] + amount;
+        // Selling a whole position back can leave -1e-17 of dust; snap it to
+        // zero so outstanding shares never go negative.
+        if new_quantity < 0.0 {
+            if new_quantity >= -DUST_TOLERANCE * amount.abs().max(1.0) {
+                new_quantity = 0.0;
+            } else {
+                return Err(MarketError::InvalidMarketState(format!(
+                    "selling {} shares of outcome {outcome} would leave {new_quantity} outstanding",
+                    amount.abs()
+                )));
+            }
+        }
+        // The new state must still price; check before mutating.
+        let mut after = self.quantities.clone();
+        after[outcome] = new_quantity;
+        lmsr::prices(&after, self.liquidity)?;
+
+        self.quantities = after;
         self.trade_count += 1;
         self.total_volume += cost.abs();
+        self.pool += cost;
 
         Ok(())
     }
@@ -213,6 +404,11 @@ impl Market {
     }
 
     /// Resolve the market with a winning outcome
+    ///
+    /// Resolution is idempotent: resolving an already-resolved market to the
+    /// *same* outcome is a successful no-op, so a retried call is safe.
+    /// Resolving it to a *different* outcome is refused with
+    /// `MarketResolved` and leaves the original resolution in place.
     pub fn resolve(&mut self, outcome: usize) -> Result<(), MarketError> {
         if outcome >= self.outcomes.len() {
             return Err(MarketError::InvalidOutcome {
@@ -222,6 +418,7 @@ impl Market {
         }
 
         match self.state {
+            MarketState::Resolved if self.resolved_outcome == Some(outcome) => Ok(()),
             MarketState::Resolved => Err(MarketError::MarketResolved),
             _ => {
                 self.state = MarketState::Resolved;
@@ -315,6 +512,58 @@ mod tests {
             Market::new("Question?".to_string(), vec!["A".to_string(), "B".to_string()], -10.0),
             Err(MarketError::InvalidLiquidity(_))
         ));
+
+        assert!(matches!(
+            Market::new("Question?".to_string(), vec!["A".to_string(), "B".to_string()], f64::NAN),
+            Err(MarketError::InvalidLiquidity(_))
+        ));
+
+        assert!(matches!(
+            Market::new("Question?".to_string(), vec!["A".to_string(), "".to_string()], 1.0),
+            Err(MarketError::EmptyOutcomeLabel(1))
+        ));
+
+        assert!(matches!(
+            Market::new("Question?".to_string(), vec!["A".to_string(), "a".to_string()], 1.0),
+            Err(MarketError::DuplicateOutcomeLabel(_))
+        ));
+    }
+
+    #[test]
+    fn test_apply_trade_tracks_pool_and_snaps_dust() {
+        let mut market = Market::new(
+            "Test".to_string(),
+            vec!["A".to_string(), "B".to_string()],
+            100.0,
+        )
+        .unwrap();
+        market.apply_trade(0, 0.3, 0.16).unwrap();
+        market.apply_trade(0, -0.1, -0.05).unwrap();
+        market.apply_trade(0, -0.1, -0.05).unwrap();
+        // 0.3 - 0.1 - 0.1 - 0.1 = -2.8e-17 in f64: snapped to exactly 0.
+        market.apply_trade(0, -0.1, -0.05).unwrap();
+        assert_eq!(market.quantities()[0], 0.0);
+        assert_relative_eq!(market.pool(), 0.01, epsilon = 1e-12);
+        // A real over-sell is refused and leaves the market untouched.
+        assert!(market.apply_trade(0, -1.0, -0.5).is_err());
+        assert_eq!(market.quantities()[0], 0.0);
+        assert_eq!(market.trade_stats().0, 4);
+    }
+
+    #[test]
+    fn test_validate_rejects_inconsistent_state() {
+        let mut market = Market::new(
+            "Test".to_string(),
+            vec!["A".to_string(), "B".to_string()],
+            100.0,
+        )
+        .unwrap();
+        assert!(market.validate().is_ok());
+        market.resolved_outcome = Some(0);
+        assert!(matches!(market.validate(), Err(MarketError::InvalidMarketState(_))));
+        market.resolved_outcome = None;
+        market.quantities = vec![0.0];
+        assert!(matches!(market.validate(), Err(MarketError::InvalidMarketState(_))));
     }
 
     #[test]

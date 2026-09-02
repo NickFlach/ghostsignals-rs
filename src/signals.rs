@@ -2,6 +2,10 @@
 //!
 //! This module provides tools for analyzing market signals, detecting convergence,
 //! and processing price time series data.
+//!
+//! Signals carry plain `Vec<f64>` prices that callers may construct by hand,
+//! so every function here tolerates NaN, infinite or negative entries: such
+//! entries are ignored, nothing panics, and no function returns NaN.
 
 use crate::MarketId;
 use chrono::{DateTime, Utc};
@@ -51,20 +55,25 @@ impl MarketSignal {
     }
 
     /// Get the most likely outcome (highest probability)
+    ///
+    /// Non-finite prices are ignored; returns `None` if no price is finite.
+    /// Ties resolve to the lowest index.
     pub fn most_likely_outcome(&self) -> Option<usize> {
         self.prices
             .iter()
             .enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .filter(|(_, p)| p.is_finite())
+            .fold(None, |best: Option<(usize, f64)>, (i, &p)| match best {
+                Some((_, bp)) if bp >= p => best,
+                _ => Some((i, p)),
+            })
             .map(|(i, _)| i)
     }
 
-    /// Get confidence in the most likely outcome
+    /// Get confidence in the most likely outcome (0.0 if no price is finite)
     pub fn confidence(&self) -> f64 {
-        self.prices
-            .iter()
-            .max_by(|a, b| a.partial_cmp(b).unwrap())
-            .copied()
+        self.most_likely_outcome()
+            .map(|i| self.prices[i])
             .unwrap_or(0.0)
     }
 }
@@ -78,10 +87,13 @@ pub struct SignalSeries {
 
 impl SignalSeries {
     /// Create a new signal series with maximum length
+    ///
+    /// A `max_length` of 0 is treated as 1 so the series always retains at
+    /// least the latest signal.
     pub fn new(max_length: usize) -> Self {
         Self {
             signals: VecDeque::new(),
-            max_length,
+            max_length: max_length.max(1),
         }
     }
 
@@ -115,23 +127,13 @@ impl SignalSeries {
         price_history(self.signals.iter().collect::<Vec<_>>().as_slice(), outcome)
     }
 
-    /// Calculate price volatility for an outcome
+    /// Calculate price volatility for an outcome (population standard deviation)
     pub fn volatility(&self, outcome: usize) -> f64 {
         let prices: Vec<f64> = self.signals
             .iter()
             .filter_map(|s| s.prices.get(outcome).copied())
             .collect();
-            
-        if prices.len() < 2 {
-            return 0.0;
-        }
-        
-        let mean = prices.iter().sum::<f64>() / prices.len() as f64;
-        let variance = prices.iter()
-            .map(|&p| (p - mean).powi(2))
-            .sum::<f64>() / prices.len() as f64;
-            
-        variance.sqrt()
+        std_dev(&prices)
     }
 
     /// Get trend direction for an outcome (-1 = down, 0 = stable, 1 = up)
@@ -163,28 +165,19 @@ impl SignalSeries {
             return false;
         }
 
-        let recent_volatility = {
-            let recent: Vec<f64> = self.signals
-                .iter()
-                .rev()
-                .take(5)
-                .filter_map(|s| s.prices.get(outcome).copied())
-                .collect();
-            
-            if recent.len() < 2 {
-                return false;
-            }
-            
-            let mean = recent.iter().sum::<f64>() / recent.len() as f64;
-            let variance = recent.iter()
-                .map(|&p| (p - mean).powi(2))
-                .sum::<f64>() / recent.len() as f64;
-                
-            variance.sqrt()
-        };
+        let recent: Vec<f64> = self.signals
+            .iter()
+            .rev()
+            .take(5)
+            .filter_map(|s| s.prices.get(outcome).copied())
+            .collect();
 
-        recent_volatility < threshold
-    }
+        if recent.len() < 2 {
+            return false;
+        }
+
+        std_dev(&recent) < threshold
+}
 
     /// Calculate momentum for an outcome
     pub fn momentum(&self, outcome: usize) -> f64 {
@@ -240,18 +233,26 @@ pub fn convergence(signals: &[&MarketSignal]) -> f64 {
             continue;
         }
 
-        // Calculate variance
-        let mean = prices.iter().sum::<f64>() / prices.len() as f64;
-        let variance = prices.iter()
-            .map(|&p| (p - mean).powi(2))
-            .sum::<f64>() / prices.len() as f64;
-
         // Convert variance to stability (lower variance = higher stability)
+        let variance = std_dev(&prices).powi(2);
         let stability = (-variance * 10.0).exp();
         total_stability += stability;
     }
 
-    total_stability / num_outcomes as f64
+    (total_stability / num_outcomes as f64).clamp(0.0, 1.0)
+}
+
+/// Population standard deviation of the finite entries of `values`;
+/// 0.0 when fewer than two entries are finite.
+fn std_dev(values: &[f64]) -> f64 {
+    let finite: Vec<f64> = values.iter().copied().filter(|v| v.is_finite()).collect();
+    if finite.len() < 2 {
+        return 0.0;
+    }
+    let n = finite.len() as f64;
+    let mean = finite.iter().sum::<f64>() / n;
+    let variance = finite.iter().map(|&p| (p - mean).powi(2)).sum::<f64>() / n;
+    variance.sqrt()
 }
 
 /// Extract price history for a specific outcome
@@ -269,29 +270,39 @@ pub fn price_history(signals: &[&MarketSignal], outcome: usize) -> Vec<(f64, f64
         .collect()
 }
 
-/// Calculate Shannon entropy of a probability distribution
-/// 
-/// Higher values indicate more uncertainty/randomness
+/// Calculate Shannon entropy of a probability distribution (in nats)
+///
+/// Higher values indicate more uncertainty/randomness. The input is
+/// normalized first, so any non-negative weights work; NaN, infinite and
+/// negative entries are ignored. The result is finite and in
+/// `[0, ln(n)]` (up to rounding). Returns 0.0 if no entry is positive.
 pub fn entropy(prices: &[f64]) -> f64 {
-    if prices.is_empty() {
+    // Scale by the maximum so weights like 1e308 do not overflow the sum.
+    let max = prices
+        .iter()
+        .copied()
+        .filter(|p| p.is_finite() && *p > 0.0)
+        .fold(0.0f64, f64::max);
+    if max == 0.0 {
         return 0.0;
     }
 
-    // Normalize to ensure valid probabilities
-    let sum: f64 = prices.iter().sum();
-    if sum <= 0.0 {
-        return 0.0;
-    }
+    let scaled: Vec<f64> = prices
+        .iter()
+        .filter(|p| p.is_finite() && **p > 0.0)
+        .map(|p| p / max)
+        .collect();
+    let sum: f64 = scaled.iter().sum();
 
     let mut entropy = 0.0;
-    for &price in prices {
-        let p = price / sum;
+    for w in scaled {
+        let p = w / sum;
         if p > 0.0 {
             entropy -= p * p.ln();
         }
     }
 
-    entropy
+    entropy.max(0.0)
 }
 
 /// Calculate maximum possible entropy for given number of outcomes
@@ -316,15 +327,18 @@ pub fn normalized_entropy(prices: &[f64]) -> f64 {
 }
 
 /// Calculate market efficiency metric
-/// 
-/// Compares trading volume to price movement
+///
+/// Total absolute price movement across the window divided by the volume
+/// traded in the window. [`MarketSignal::volume`] is the market's cumulative
+/// volume, so the volume traded is `last.volume - first.volume`. Returns 0.0
+/// when fewer than two signals are given or no volume was traded.
 pub fn efficiency(signals: &[&MarketSignal]) -> f64 {
     if signals.len() < 2 {
         return 0.0;
     }
 
-    let total_volume: f64 = signals.iter().map(|s| s.volume).sum();
-    if total_volume == 0.0 {
+    let total_volume = signals[signals.len() - 1].volume - signals[0].volume;
+    if !(total_volume.is_finite() && total_volume > 0.0) {
         return 0.0;
     }
 
@@ -340,7 +354,7 @@ pub fn efficiency(signals: &[&MarketSignal]) -> f64 {
     }
 
     // Efficiency is movement per unit volume
-    if total_volume > 0.0 {
+    if total_movement.is_finite() {
         total_movement / total_volume
     } else {
         0.0
@@ -535,7 +549,7 @@ mod tests {
         let market_id = Uuid::new_v4();
 
         // Add signals with varying prices
-        let prices = vec![0.5, 0.6, 0.4, 0.7, 0.3];
+        let prices = [0.5, 0.6, 0.4, 0.7, 0.3];
         for (i, &price) in prices.iter().enumerate() {
             let signal = MarketSignal::new(market_id, vec![price, 1.0 - price], i as u64, i as f64);
             series.push(signal);
@@ -636,6 +650,25 @@ mod tests {
         
         let eff = efficiency(&signal_refs);
         assert!(eff > 0.0); // Should have some efficiency measure
+        // 0.4 of movement over 20 units of volume traded in the window.
+        assert_relative_eq!(eff, 0.4 / 20.0, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn test_signal_helpers_ignore_non_finite() {
+        let market_id = Uuid::new_v4();
+        let signal = MarketSignal::new(market_id, vec![f64::NAN, 0.4, f64::INFINITY, 0.6], 0, 0.0);
+        assert_eq!(signal.most_likely_outcome(), Some(3));
+        assert_eq!(signal.confidence(), 0.6);
+        assert!(signal.entropy().is_finite());
+
+        let mut series = SignalSeries::new(5);
+        series.push(MarketSignal::new(market_id, vec![0.5, 0.5], 0, 0.0));
+        series.push(MarketSignal::new(market_id, vec![f64::NAN, 0.5], 1, 0.0));
+        series.push(MarketSignal::new(market_id, vec![0.5, 0.5], 2, 0.0));
+        assert_eq!(series.volatility(0), 0.0);
+        assert!(series.is_stable(0, 0.1));
+        assert!(series.convergence().is_finite());
     }
 
     #[test]
@@ -644,7 +677,7 @@ mod tests {
         let market_id = Uuid::new_v4();
 
         // Add signals with accelerating price change
-        let prices = vec![0.3, 0.4, 0.6]; // Accelerating upward
+        let prices = [0.3, 0.4, 0.6]; // Accelerating upward
         for (i, &price) in prices.iter().enumerate() {
             let signal = MarketSignal::new(market_id, vec![price, 1.0 - price], i as u64, i as f64);
             series.push(signal);
