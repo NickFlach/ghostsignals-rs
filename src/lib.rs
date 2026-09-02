@@ -1,23 +1,41 @@
 //! # ghostsignals
-//! 
+//!
 //! Prediction markets as collective intelligence.
-//! 
+//!
 //! Based on Hanson's Logarithmic Market Scoring Rule (LMSR),
 //! ghostsignals turns agent opinions into calibrated probabilities.
 //! When agents trade on what they believe, the market price converges
 //! to the collective's true estimate — emergence from interference.
-//! 
+//!
 //! Part of the ghostmagicOS ecosystem: dx/dt = f(x) - Iηx
 //! The market IS the interference term.
+//!
+//! # Invariants
+//!
+//! The crate is the reference implementation for other GhostSignals ports,
+//! so it is explicit about what it guarantees:
+//!
+//! * [`lmsr`]: `b` is finite and positive, quantities and amounts are finite;
+//!   every result is finite or an error. Prices are in `[0, 1]` and sum to 1.
+//! * [`Market`]: always satisfies [`Market::validate`], including after
+//!   deserialization. Outstanding shares never go negative.
+//! * [`Portfolio`]: cash is finite and never negative; a trader can never
+//!   sell more than they hold; a whole position can always be closed.
+//! * Money is conserved: the sum of all balances plus every market's
+//!   [`Market::pool`] is constant across any sequence of trades, and the
+//!   market maker's loss at settlement is bounded by `b · ln(n)`.
+//!
+//! The README examples below are compiled as doctests.
+#![doc = include_str!("../README.md")]
 
 use std::collections::HashMap;
 use uuid::Uuid;
 use serde::{Deserialize, Serialize};
 
-mod lmsr;
-mod market;
-mod trading;
-mod signals;
+pub mod lmsr;
+pub mod market;
+pub mod trading;
+pub mod signals;
 
 pub use lmsr::*;
 pub use market::*;
@@ -25,7 +43,7 @@ pub use trading::*;
 pub use signals::*;
 
 /// High-level prediction market engine
-/// 
+///
 /// The Engine manages multiple markets and trader portfolios,
 /// providing a clean interface for market operations.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,7 +62,7 @@ impl Engine {
     }
 
     /// Create a new market
-    /// 
+    ///
     /// Returns a unique market ID that can be used for subsequent operations.
     pub fn create_market(
         &mut self,
@@ -58,7 +76,22 @@ impl Engine {
         Ok(id)
     }
 
+    /// Credit cash to a trader, creating the portfolio if needed
+    ///
+    /// # Errors
+    /// `InvalidAmount` if `amount` is negative, NaN or infinite.
+    pub fn deposit(&mut self, trader_id: TraderId, amount: f64) -> Result<(), TradeError> {
+        self.portfolios
+            .entry(trader_id)
+            .or_insert_with(|| Portfolio::new(trader_id))
+            .add_cash(amount)
+    }
+
     /// Execute a trade
+    ///
+    /// `amount > 0` buys shares of `outcome`, `amount < 0` sells them. A
+    /// portfolio is created on first use; fund it with [`Engine::deposit`]
+    /// before buying. On error neither the market nor the portfolio changes.
     pub fn trade(
         &mut self,
         market_id: MarketId,
@@ -69,10 +102,10 @@ impl Engine {
         let market = self.markets.get_mut(&market_id)
             .ok_or(TradeError::MarketNotFound)?;
 
-        // Ensure portfolio exists
-        self.portfolios.entry(trader_id).or_insert_with(|| Portfolio::new(trader_id));
-
-        let portfolio = self.portfolios.get_mut(&trader_id).unwrap();
+        let portfolio = self
+            .portfolios
+            .entry(trader_id)
+            .or_insert_with(|| Portfolio::new(trader_id));
         execute_trade(market, trader_id, outcome, amount, portfolio)
     }
 
@@ -83,11 +116,39 @@ impl Engine {
         Ok(market.prices())
     }
 
-    /// Resolve a market
+    /// Resolve a market (idempotent for the same outcome, see [`Market::resolve`])
     pub fn resolve(&mut self, market_id: MarketId, outcome: usize) -> Result<(), MarketError> {
         let market = self.markets.get_mut(&market_id)
             .ok_or(MarketError::MarketNotFound)?;
         market.resolve(outcome)
+    }
+
+    /// Pay out a resolved market
+    ///
+    /// Every trader holding shares of the winning outcome is credited one
+    /// unit per share; all positions in the market are then cleared. Returns
+    /// `(trader, amount)` for each non-zero payout. Settling the same market
+    /// again pays nothing, so the call is idempotent.
+    ///
+    /// # Errors
+    /// `MarketNotFound`, or `MarketNotResolved` if the market has not been
+    /// resolved yet.
+    pub fn settle(&mut self, market_id: MarketId) -> Result<Vec<(TraderId, f64)>, MarketError> {
+        let market = self.markets.get(&market_id)
+            .ok_or(MarketError::MarketNotFound)?;
+        let winner = match (market.state(), market.resolved_outcome()) {
+            (MarketState::Resolved, Some(winner)) => winner,
+            _ => return Err(MarketError::MarketNotResolved),
+        };
+
+        let mut payouts = Vec::new();
+        for (trader_id, portfolio) in self.portfolios.iter_mut() {
+            let paid = portfolio.settle_market(market_id, winner);
+            if paid > 0.0 {
+                payouts.push((*trader_id, paid));
+            }
+        }
+        Ok(payouts)
     }
 
     /// Get market signal
@@ -100,6 +161,11 @@ impl Engine {
     /// Get a market by ID
     pub fn market(&self, market_id: MarketId) -> Option<&Market> {
         self.markets.get(&market_id)
+    }
+
+    /// Iterate over all markets
+    pub fn markets(&self) -> impl Iterator<Item = &Market> {
+        self.markets.values()
     }
 
     /// Get a trader's portfolio
@@ -117,7 +183,7 @@ impl Default for Engine {
 /// Market identifier
 pub type MarketId = Uuid;
 
-/// Trader identifier  
+/// Trader identifier
 pub type TraderId = Uuid;
 
 #[cfg(test)]
@@ -142,9 +208,10 @@ mod tests {
                 100.0,
             )
             .unwrap();
-        
+
         assert!(engine.market(market_id).is_some());
-        
+        assert_eq!(engine.markets().count(), 1);
+
         let prices = engine.prices(market_id).unwrap();
         assert_eq!(prices.len(), 2);
         assert_relative_eq!(prices[0] + prices[1], 1.0, epsilon = 1e-10);
@@ -162,20 +229,40 @@ mod tests {
             .unwrap();
 
         let trader = Uuid::new_v4();
-        
-        // Add cash to portfolio first
-        if !engine.portfolios.contains_key(&trader) {
-            engine.portfolios.insert(trader, Portfolio::new(trader));
-        }
-        engine.portfolios.get_mut(&trader).unwrap().add_cash(1000.0);
-        
+
+        // An unfunded trader cannot buy.
+        assert!(matches!(
+            engine.trade(market_id, trader, 0, 10.0),
+            Err(TradeError::InsufficientFunds { .. })
+        ));
+
+        engine.deposit(trader, 1000.0).unwrap();
         let trade = engine.trade(market_id, trader, 0, 10.0).unwrap();
-        
+
         assert_eq!(trade.outcome, 0);
         assert_eq!(trade.amount, 10.0);
         assert!(trade.cost > 0.0);
-        
+
         // Portfolio should be created
         assert!(engine.portfolio(trader).is_some());
+        assert_relative_eq!(
+            engine.portfolio(trader).unwrap().cash(),
+            1000.0 - trade.cost,
+            epsilon = 1e-12
+        );
+    }
+
+    #[test]
+    fn test_unknown_market_and_trader() {
+        let mut engine = Engine::new();
+        let missing = Uuid::new_v4();
+        assert!(matches!(engine.prices(missing), Err(MarketError::MarketNotFound)));
+        assert!(matches!(engine.resolve(missing, 0), Err(MarketError::MarketNotFound)));
+        assert!(matches!(engine.signal(missing), Err(MarketError::MarketNotFound)));
+        assert!(matches!(
+            engine.trade(missing, Uuid::new_v4(), 0, 1.0),
+            Err(TradeError::MarketNotFound)
+        ));
+        assert!(engine.portfolio(missing).is_none());
     }
 }

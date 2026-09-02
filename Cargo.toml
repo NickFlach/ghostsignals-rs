@@ -1,6 +1,6 @@
 [package]
 name = "ghostsignals"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Prediction markets as collective intelligence using LMSR"
 license = "MIT"
@@ -16,3 +16,5 @@ thiserror = "1.0"
 
 [dev-dependencies]
 approx = "0.5"
+proptest = "1.5"
+serde_json = { version = "1.0", features = ["float_roundtrip"] }
