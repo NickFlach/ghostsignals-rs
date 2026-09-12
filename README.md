@@ -4,7 +4,7 @@ Prediction markets as collective intelligence using the Logarithmic Market Scori
 
 [![Crates.io](https://img.shields.io/crates/v/ghostsignals.svg)](https://crates.io/crates/ghostsignals)
 [![Documentation](https://docs.rs/ghostsignals/badge.svg)](https://docs.rs/ghostsignals)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![License](https://img.shields.io/badge/license-Space%20Child%20v1.0-blueviolet)]()
 
 > *"When agents trade on what they believe, the market price converges to the collective's true estimate — emergence from interference."*
 
@@ -428,7 +428,7 @@ Added:
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](https://github.com/NickFlach/ghostsignals-rs/blob/master/LICENSE) file for details.
+This project is licensed under the Space Child License v1.0 — see [LICENSE](./LICENSE) for the terms.
 
 ## Contributing
 
